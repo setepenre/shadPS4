@@ -86,6 +86,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameController* controller_
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height);
     SDL_SetNumberProperty(props, "flags", SDL_WINDOW_VULKAN);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN, true);
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     if (window == nullptr) {
@@ -228,6 +229,9 @@ void WindowSDL::OnKeyPress(const SDL_Event* event) {
     int ax = 0;
     std::string backButtonBehavior = Config::getBackButtonBehavior();
     switch (event->key.key) {
+    case SDLK_ESCAPE:
+        is_open = false;
+        break;
     case SDLK_UP:
         button = OrbisPadButtonDataOffset::Up;
         break;
@@ -432,18 +436,31 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
         break;
     }
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-        axis = event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX           ? Input::Axis::LeftX
-               : event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY         ? Input::Axis::LeftY
-               : event->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX        ? Input::Axis::RightX
-               : event->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTY        ? Input::Axis::RightY
-               : event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER  ? Input::Axis::TriggerLeft
-               : event->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER ? Input::Axis::TriggerRight
-                                                                     : Input::Axis::AxisMax;
+        switch (event->gaxis.axis) {
+        case SDL_GAMEPAD_AXIS_LEFTX:
+            axis = Input::Axis::LeftX;
+            break;
+        case SDL_GAMEPAD_AXIS_LEFTY:
+            axis = Input::Axis::LeftY;
+            break;
+        case SDL_GAMEPAD_AXIS_RIGHTX:
+            axis = Input::Axis::RightX;
+            break;
+        case SDL_GAMEPAD_AXIS_RIGHTY:
+            axis = Input::Axis::RightY;
+            break;
+        case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
+            axis = Input::Axis::TriggerLeft;
+            break;
+        case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:
+            axis = Input::Axis::TriggerRight;
+            break;
+        default:
+            axis = Input::Axis::AxisMax;
+        }
         if (axis != Input::Axis::AxisMax) {
-            if (event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
-                event->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+            if (axis == Input::Axis::TriggerLeft || axis == Input::Axis::TriggerRight) {
                 controller->Axis(0, axis, Input::GetAxis(0, 0x8000, event->gaxis.value));
-
             } else {
                 controller->Axis(0, axis, Input::GetAxis(-0x8000, 0x8000, event->gaxis.value));
             }
