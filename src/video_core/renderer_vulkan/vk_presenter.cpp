@@ -432,6 +432,7 @@ bool Presenter::ShowSplash(Frame* frame /*= nullptr*/) {
                                           splash->GetImageInfo().width,
                                           splash->GetImageInfo().height, 0);
             splash_img.emplace(instance, present_scheduler, info);
+            splash_img->flags ^= VideoCore::ImageFlagBits::GpuDirty;
             texture_cache.RefreshImage(*splash_img);
 
             splash_img->Transit(vk::ImageLayout::eTransferSrcOptimal,

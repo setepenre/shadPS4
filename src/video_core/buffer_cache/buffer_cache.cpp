@@ -323,7 +323,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
 
 std::pair<Buffer*, u32> BufferCache::ObtainViewBuffer(VAddr gpu_addr, u32 size, bool prefer_gpu) {
     // Check if any buffer contains the full requested range.
-    const u64 page = gpu_addr >> CACHING_PAGEBITS;
+    const u64 page = gpu_addr >> (64 - (Traits::AddressSpaceBits - Traits::PageBits));
     const BufferId buffer_id = page_table[page];
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
