@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <thread>
 #include <queue>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 

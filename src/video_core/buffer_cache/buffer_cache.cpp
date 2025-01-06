@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+
 #include "common/alignment.h"
+#include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "common/types.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -13,6 +16,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+
+#include <fmt/format.h>
+#include <vk_mem_alloc.h>
 
 namespace VideoCore {
 
@@ -49,6 +55,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     ASSERT_MSG(null_view_result == vk::Result::eSuccess, "Failed to create null buffer view.");
     null_buffer_view = null_view;
     Vulkan::SetObjectName(instance.GetDevice(), null_buffer_view, "Null Buffer View");
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    scheduler.EndRendering();
+    cmdbuf.fillBuffer(gds_buffer.buffer, 0, GdsBufferSize, 0);
 }
 
 BufferCache::~BufferCache() = default;
@@ -244,50 +254,308 @@ void BufferCache::BindIndexBuffer(u32 index_offset) {
     cmdbuf.bindIndexBuffer(vk_buffer->Handle(), offset, index_type);
 }
 
+void BufferCache::LogBufferValue(const std::string& prefix, const Buffer& buffer, u32 offset) {
+    const u32 size = sizeof(u32), length = offset / size + 1;
+    VmaAllocationInfo alloc_info{};
+    vmaGetAllocationInfo(instance.GetAllocator(), buffer.Allocation(), &alloc_info);
+    ASSERT(offset + size <= alloc_info.size);
+    void* ptr{};
+    const auto result = vmaMapMemory(instance.GetAllocator(), buffer.Allocation(), &ptr);
+    // LOG_CRITICAL(Debug, "result = {}", string_VkResult(result));
+    // ASSERT(result == VK_SUCCESS);
+    if (result == VK_SUCCESS) {
+        u32* data = new u32[length](0);
+        std::memcpy(data, ptr, length * size);
+        std::string values = "";
+        for (std::size_t i = 0; i < length; ++i) {
+            values += fmt::format("data[i = {}] = {} ", i, data[i]);
+        }
+        LOG_CRITICAL(Debug, "{} read ptr = {} offset = {} {}", prefix, fmt::ptr(ptr), offset,
+                     values);
+        vmaUnmapMemory(instance.GetAllocator(), buffer.Allocation());
+        delete[] data;
+    }
+}
+
+std::string values_from_carray(const u32* data, u32 length) {
+    std::string values = "";
+    for (u32 i = 0; i < length; ++i) {
+        values += fmt::format(" {}", data[i]);
+    }
+    return values;
+}
+
+u32 BufferCache::ProbeBufferValue(const Buffer& buffer, u32 offset, const std::string& prefix) {
+    bool write = false;
+    u32 offset_shift = 0;
+    const u32 size = sizeof(u32), max_value = 16384;
+    VmaAllocationInfo alloc_info{};
+    vmaGetAllocationInfo(instance.GetAllocator(), buffer.Allocation(), &alloc_info);
+    ASSERT(offset + size <= alloc_info.size);
+    void* ptr{};
+    // VkResult result =
+    //     vmaInvalidateAllocation(instance.GetAllocator(), buffer.Allocation(), 0, offset + size);
+    // if (result != VK_SUCCESS) {
+    //     return offset_shift;
+    // }
+    VkResult result = vmaMapMemory(instance.GetAllocator(), buffer.Allocation(), &ptr);
+    // LOG_CRITICAL(Debug, "result = {}", string_VkResult(result));
+    // ASSERT(result == VK_SUCCESS);
+    if (result != VK_SUCCESS) {
+        return offset_shift;
+    }
+    // const u32 length = offset / size + 1;
+    // u32* data = new u32[length](0);
+    // std::memcpy(data, ptr, length * size);
+    // std::string values = values_from_carray(data, length);
+    u32 offset_index = offset / size, data = 0;
+    std::memcpy(&data, &((u32*)ptr)[offset_index], size);
+    LOG_CRITICAL(Debug, "{}: read from {} + offset {}: {}", prefix, fmt::ptr(ptr), offset, data);
+    if (data > max_value) {
+        data = max_value;
+        write = true;
+    }
+    // for (u32 i = 0; i < length; ++i) {
+    //     if (data[i] > max_value) {
+    //         write |= true;
+    //         offset_shift = (length - 1 - i) * size;
+    //         data[i] = 0;
+    //     }
+    // }
+    if (write) {
+        std::memcpy(&((u32*)ptr)[offset_index], &data, size);
+        LOG_CRITICAL(Debug, "{}: wrote to {} + offset {}: {}", prefix, fmt::ptr(ptr), offset, data);
+        // std::memcpy(ptr, data, length * size);
+        // values = values_from_carray(data, length);
+        // LOG_CRITICAL(Debug, "{}: wrote from {} to offset {}:{}", prefix, fmt::ptr(ptr), offset,
+        //              values);
+        vmaFlushAllocation(instance.GetAllocator(), buffer.Allocation(), offset, size);
+        const vk::BufferMemoryBarrier2 barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eHostWrite | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eMemoryRead |
+                             vk::AccessFlagBits2::eTransferRead,
+            .buffer = buffer.Handle(),
+            .offset = offset,
+            .size = size,
+        };
+
+        scheduler.EndRendering();
+        const auto cmdbuf = scheduler.CommandBuffer();
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier,
+        });
+    }
+    vmaUnmapMemory(instance.GetAllocator(), buffer.Allocation());
+    return offset_shift;
+}
+
 void BufferCache::InlineData(VAddr address, const void* value, u32 num_bytes, bool is_gds) {
     ASSERT_MSG(address % 4 == 0, "GDS offset must be dword aligned");
+    // std::string values = values_from_carray((u32*)value, num_bytes / sizeof(u32));
+    // LOG_CRITICAL(Debug, "values ={}", values);
     if (!is_gds && !IsRegionRegistered(address, num_bytes)) {
         memcpy(std::bit_cast<void*>(address), value, num_bytes);
         return;
     }
+
+    const BufferId buffer_id =
+        is_gds ? BufferId{} : FindBuffer(address, num_bytes, MemoryUsage::Stream);
+    const Buffer& buffer = is_gds ? gds_buffer : GetBuffer(buffer_id);
+
+    u32 shift = ProbeBufferValue(
+        buffer, buffer.Offset(address),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, buffer_id.index));
+    u32* data = new u32[shift / sizeof(u32) + 1](*(u32*)value);
+    // if (ProbeBufferValue(buffer, buffer.Offset(address),
+    //                      fmt::format("{}:{}", __FUNCTION__, __LINE__))) {
+    //     LOG_CRITICAL(Debug, "Skipped updating buffer");
+    //     return;
+    // }
+    // LogBufferValue("InlineData:", buffer, buffer.Offset(address));
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
-    const Buffer* buffer = [&] {
-        if (is_gds) {
-            return &gds_buffer;
-        }
-        const BufferId buffer_id = FindBuffer(address, num_bytes);
-        return &slot_buffers[buffer_id];
-    }();
     const vk::BufferMemoryBarrier2 pre_barrier = {
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .buffer = buffer->Handle(),
-        .offset = buffer->Offset(address),
-        .size = num_bytes,
+        .buffer = buffer.Handle(),
+        .offset = buffer.Offset(address) - shift,
+        .size = num_bytes + shift,
     };
     const vk::BufferMemoryBarrier2 post_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
-        .buffer = buffer->Handle(),
-        .offset = buffer->Offset(address),
-        .size = num_bytes,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .buffer = buffer.Handle(),
+        .offset = buffer.Offset(address) - shift,
+        .size = num_bytes + shift,
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &pre_barrier,
     });
-    cmdbuf.updateBuffer(buffer->Handle(), buffer->Offset(address), num_bytes, value);
+    cmdbuf.updateBuffer(buffer.Handle(), buffer.Offset(address) - shift, num_bytes + shift, data);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &post_barrier,
     });
+
+    ProbeBufferValue(
+        buffer, buffer.Offset(address),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, buffer_id.index));
+    delete[] data;
+}
+
+void BufferCache::CopyBuffer(const vk::Buffer& src, u32 src_offset, const vk::Buffer& dst,
+                             u32 dst_offset, u32 size) {
+    const std::array pre_barriers = {
+        vk::BufferMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .buffer = dst,
+            .offset = dst_offset,
+            .size = size,
+        },
+        vk::BufferMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .buffer = src,
+            .offset = src_offset,
+            .size = size,
+        },
+    };
+    const std::array post_barriers = {
+        vk::BufferMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .buffer = dst,
+            .offset = dst_offset,
+            .size = size,
+        },
+        vk::BufferMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .buffer = src,
+            .offset = src_offset,
+            .size = size,
+        },
+    };
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::BufferCopy region = {
+        .srcOffset = src_offset,
+        .dstOffset = dst_offset,
+        .size = size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = pre_barriers.size(),
+        .pBufferMemoryBarriers = pre_barriers.data(),
+    });
+    cmdbuf.copyBuffer(src, dst, region);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = post_barriers.size(),
+        .pBufferMemoryBarriers = post_barriers.data(),
+    });
+}
+
+void BufferCache::CopyBufferGDSToMem(VAddr src, VAddr dst, u32 num_bytes) {
+    const BufferId dst_buffer_id = FindBuffer(dst, num_bytes, MemoryUsage::Stream);
+    const Buffer& src_buffer = gds_buffer;
+    const Buffer& dst_buffer = GetBuffer(dst_buffer_id);
+
+    // LogBufferValue("CopyBufferGDSToMem:", src_buffer, src_buffer.Offset(src));
+    u32 shift = ProbeBufferValue(
+        src_buffer, src_buffer.Offset(src),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, BufferId{}.index));
+    // if (ProbeBufferValue(src_buffer, src_buffer.Offset(src),
+    //                      fmt::format("{}:{}", __FUNCTION__, __LINE__))) {
+    //     LOG_CRITICAL(Debug, "Skipped copy buffer");
+    //     return;
+    // }
+
+    CopyBuffer(src_buffer.Handle(), src_buffer.Offset(src) - shift, dst_buffer.Handle(),
+               dst_buffer.Offset(dst) - shift, num_bytes + shift);
+
+    ProbeBufferValue(
+        dst_buffer, dst_buffer.Offset(dst),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, dst_buffer_id.index));
+}
+
+void BufferCache::CopyBufferMemToGDS(VAddr src, VAddr dst, u32 num_bytes) {
+    if (!IsRegionRegistered(src, num_bytes)) {
+        InlineData(dst, std::bit_cast<void*>(src), num_bytes, true);
+        return;
+    }
+
+    const BufferId src_buffer_id = FindBuffer(src, num_bytes, MemoryUsage::Stream);
+    const Buffer& src_buffer = GetBuffer(src_buffer_id);
+    const Buffer& dst_buffer = gds_buffer;
+
+    // LogBufferValue("CopyBufferMemToGDS:", src_buffer, src_buffer.Offset(src));
+    u32 shift = ProbeBufferValue(
+        src_buffer, src_buffer.Offset(src),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, src_buffer_id.index));
+    // if (ProbeBufferValue(src_buffer, src_buffer.Offset(src),
+    //                      fmt::format("{}:{}", __FUNCTION__, __LINE__))) {
+    //     LOG_CRITICAL(Debug, "Skipped copy buffer");
+    //     return;
+    // }
+
+    CopyBuffer(src_buffer.Handle(), src_buffer.Offset(src) - shift, dst_buffer.Handle(),
+               dst_buffer.Offset(dst) - shift, num_bytes + shift);
+
+    ProbeBufferValue(
+        dst_buffer, dst_buffer.Offset(dst),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, BufferId{}.index));
+}
+
+void BufferCache::CopyBufferMemToMem(VAddr src, VAddr dst, u32 num_bytes) {
+    if (!IsRegionRegistered(src, num_bytes) && !IsRegionRegistered(dst, num_bytes)) {
+        std::string values =
+            values_from_carray((u32*)std::bit_cast<void*>(src), num_bytes / sizeof(u32));
+        LOG_CRITICAL(Debug, "values ={}", values);
+        std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+        return;
+    }
+
+    const BufferId src_buffer_id = FindBuffer(src, num_bytes, MemoryUsage::Stream);
+    const BufferId dst_buffer_id = FindBuffer(dst, num_bytes, MemoryUsage::Stream);
+    const Buffer& src_buffer = GetBuffer(src_buffer_id);
+    const Buffer& dst_buffer = GetBuffer(dst_buffer_id);
+
+    u32 shift = ProbeBufferValue(
+        src_buffer, src_buffer.Offset(src),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, src_buffer_id.index));
+    // if (ProbeBufferValue(src_buffer, src_buffer.Offset(src),
+    //                      fmt::format("{}:{}", __FUNCTION__, __LINE__))) {
+    //     LOG_CRITICAL(Debug, "Skipped copy buffer");
+    //     return;
+    // }
+
+    CopyBuffer(src_buffer.Handle(), src_buffer.Offset(src) - shift, dst_buffer.Handle(),
+               dst_buffer.Offset(dst) - shift, num_bytes + shift);
+
+    ProbeBufferValue(
+        dst_buffer, dst_buffer.Offset(dst),
+        fmt::format("{}:{} buffer_id.index = {}", __FUNCTION__, __LINE__, dst_buffer_id.index));
 }
 
 std::pair<Buffer*, u32> BufferCache::ObtainHostUBO(std::span<const u32> data) {
@@ -309,10 +577,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         return {&stream_buffer, offset};
     }
 
-    if (!buffer_id || slot_buffers[buffer_id].is_deleted) {
+    if (!buffer_id || GetBuffer(buffer_id).is_deleted) {
         buffer_id = FindBuffer(device_addr, size);
     }
-    Buffer& buffer = slot_buffers[buffer_id];
+    Buffer& buffer = GetBuffer(buffer_id);
     SynchronizeBuffer(buffer, device_addr, size, is_texel_buffer);
     if (is_written) {
         memory_tracker.MarkRegionAsGpuModified(device_addr, size);
@@ -326,7 +594,7 @@ std::pair<Buffer*, u32> BufferCache::ObtainViewBuffer(VAddr gpu_addr, u32 size, 
     const u64 page = gpu_addr >> (64 - (Traits::AddressSpaceBits - Traits::PageBits));
     const BufferId buffer_id = page_table[page];
     if (buffer_id) {
-        Buffer& buffer = slot_buffers[buffer_id];
+        Buffer& buffer = GetBuffer(buffer_id);
         if (buffer.IsInBounds(gpu_addr, size)) {
             SynchronizeBuffer(buffer, gpu_addr, size, false);
             return {&buffer, buffer.Offset(gpu_addr)};
@@ -353,9 +621,12 @@ bool BufferCache::IsRegionRegistered(VAddr addr, size_t size) {
             continue;
         }
         std::shared_lock lk{mutex};
-        Buffer& buffer = slot_buffers[buffer_id];
+        Buffer& buffer = GetBuffer(buffer_id);
         const VAddr buf_start_addr = buffer.CpuAddr();
         const VAddr buf_end_addr = buf_start_addr + buffer.SizeBytes();
+        // if (buf_start_addr <= addr && addr < buf_end_addr && buf_start_addr < end_addr &&
+        //     end_addr <= buf_end_addr) {
+        // if (buffer.IsInBounds(addr, size)) {
         if (buf_start_addr < end_addr && addr < buf_end_addr) {
             return true;
         }
@@ -372,20 +643,20 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker.IsRegionGpuModified(addr, size);
 }
 
-BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size) {
+BufferId BufferCache::FindBuffer(VAddr device_addr, u32 size, MemoryUsage memory_usage) {
     if (device_addr == 0) {
         return NULL_BUFFER_ID;
     }
     const u64 page = device_addr >> CACHING_PAGEBITS;
     const BufferId buffer_id = page_table[page];
     if (!buffer_id) {
-        return CreateBuffer(device_addr, size);
+        return CreateBuffer(device_addr, size, memory_usage);
     }
-    const Buffer& buffer = slot_buffers[buffer_id];
+    const Buffer& buffer = GetBuffer(buffer_id);
     if (buffer.IsInBounds(device_addr, size)) {
         return buffer_id;
     }
-    return CreateBuffer(device_addr, size);
+    return CreateBuffer(device_addr, size, memory_usage);
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 wanted_size) {
@@ -427,7 +698,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         if (!overlap_id) {
             continue;
         }
-        Buffer& overlap = slot_buffers[overlap_id];
+        Buffer& overlap = GetBuffer(overlap_id);
         if (overlap.is_picked) {
             continue;
         }
@@ -440,7 +711,7 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
         }
         const VAddr overlap_end = overlap_device_addr + overlap.SizeBytes();
         const bool expands_right = overlap_end > end;
-        if (overlap_end > end) {
+        if (expands_right) {
             end = overlap_end;
         }
         stream_score += overlap.StreamScore();
@@ -466,8 +737,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(VAddr device_addr, u32 w
 
 void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
                               bool accumulate_stream_score) {
-    Buffer& new_buffer = slot_buffers[new_buffer_id];
-    Buffer& overlap = slot_buffers[overlap_id];
+    Buffer& new_buffer = GetBuffer(new_buffer_id);
+    Buffer& overlap = GetBuffer(overlap_id);
     if (accumulate_stream_score) {
         new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
     }
@@ -524,7 +795,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     DeleteBuffer(overlap_id);
 }
 
-BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, MemoryUsage memory_usage) {
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -532,10 +803,10 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
     const BufferId new_buffer_id = [&] {
         std::scoped_lock lk{mutex};
-        return slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-                                   AllFlags, size);
+        return slot_buffers.insert(instance, scheduler, memory_usage, overlap.begin, AllFlags,
+                                   size);
     }();
-    auto& new_buffer = slot_buffers[new_buffer_id];
+    auto& new_buffer = GetBuffer(new_buffer_id);
     const size_t size_bytes = new_buffer.SizeBytes();
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.EndRendering();
@@ -544,6 +815,9 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         JoinOverlap(new_buffer_id, overlap_id, !overlap.has_stream_leap);
     }
     Register(new_buffer_id);
+    LOG_CRITICAL(
+        Debug, "new_buffer_id.index = {} wanted_size = {} size_bytes = {} memory_usage = {}",
+        new_buffer_id.index, wanted_size, size_bytes, VideoCore::BufferTypeName(memory_usage));
     return new_buffer_id;
 }
 
@@ -557,7 +831,7 @@ void BufferCache::Unregister(BufferId buffer_id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId buffer_id) {
-    Buffer& buffer = slot_buffers[buffer_id];
+    Buffer& buffer = GetBuffer(buffer_id);
     const auto size = buffer.SizeBytes();
     const VAddr device_addr_begin = buffer.CpuAddr();
     const VAddr device_addr_end = device_addr_begin + size;
@@ -743,9 +1017,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
 }
 
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
-    Buffer& buffer = slot_buffers[buffer_id];
+    Buffer& buffer = GetBuffer(buffer_id);
     Unregister(buffer_id);
-    scheduler.DeferOperation([this, buffer_id] { slot_buffers.erase(buffer_id); });
+    scheduler.DeferOperation([this, buffer_id] {
+        std::scoped_lock lk{mutex};
+        slot_buffers.erase(buffer_id);
+    });
     buffer.is_deleted = true;
 }
 

@@ -29,8 +29,18 @@ std::string_view BufferTypeName(MemoryUsage type) {
 }
 
 [[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryUsage usage) {
-    return usage != MemoryUsage::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                             : VkMemoryPropertyFlagBits{};
+    switch (usage) {
+    case MemoryUsage::Stream:
+        return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    case MemoryUsage::DeviceLocal:
+        return VkMemoryPropertyFlagBits{};
+    case MemoryUsage::Upload:
+    case MemoryUsage::Download:
+    default:
+        return VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    }
+    // return usage != MemoryUsage::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+    //                                          : VkMemoryPropertyFlagBits{};
 }
 
 [[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryUsage usage) {
@@ -39,6 +49,7 @@ std::string_view BufferTypeName(MemoryUsage type) {
     case MemoryUsage::Stream:
         return VMA_ALLOCATION_CREATE_MAPPED_BIT |
                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+        // VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
     case MemoryUsage::Download:
         return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
     case MemoryUsage::DeviceLocal:

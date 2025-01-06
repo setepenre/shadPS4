@@ -899,6 +899,18 @@ void Rasterizer::InlineData(VAddr address, const void* value, u32 num_bytes, boo
     buffer_cache.InlineData(address, value, num_bytes, is_gds);
 }
 
+void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (src_gds && !dst_gds) {
+        buffer_cache.CopyBufferGDSToMem(src, dst, num_bytes);
+    }
+    if (!src_gds && dst_gds) {
+        buffer_cache.CopyBufferMemToGDS(src, dst, num_bytes);
+    }
+    if (!src_gds && !dst_gds) {
+        buffer_cache.CopyBufferMemToMem(src, dst, num_bytes);
+    }
+}
+
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     auto* gds_buf = buffer_cache.GetGdsBuffer();
     u32 value;

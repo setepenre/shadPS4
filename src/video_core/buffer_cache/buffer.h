@@ -30,6 +30,7 @@ enum class MemoryUsage {
     Download,    ///< Requires a host visible memory type optimized for GPU to CPU readbacks
     Stream,      ///< Requests device local host visible buffer, falling back host memory.
 };
+std::string_view BufferTypeName(MemoryUsage type);
 
 constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformTexelBuffer |
@@ -98,7 +99,7 @@ public:
 
     /// Returns true when vaddr -> vaddr+size is fully contained in the buffer
     [[nodiscard]] bool IsInBounds(VAddr addr, u64 size) const noexcept {
-        return addr >= cpu_addr && addr + size <= cpu_addr + SizeBytes();
+        return addr >= cpu_addr && addr + size <= cpu_addr + size_bytes;
     }
 
     /// Returns the base CPU address of the buffer
@@ -116,7 +117,11 @@ public:
     }
 
     vk::Buffer Handle() const noexcept {
-        return buffer;
+        return buffer.buffer;
+    }
+
+    VmaAllocation Allocation() const {
+        return buffer.allocation;
     }
 
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlagBits2 dst_acess_mask,

@@ -68,6 +68,7 @@ public:
 
     /// Retrieves the buffer with the specified id.
     [[nodiscard]] Buffer& GetBuffer(BufferId id) {
+        // std::scoped_lock lk{mutex};
         return slot_buffers[id];
     }
 
@@ -87,6 +88,9 @@ public:
 
     /// Writes a value to GPU buffer.
     void InlineData(VAddr address, const void* value, u32 num_bytes, bool is_gds);
+    void CopyBufferGDSToMem(VAddr src, VAddr dst, u32 num_bytes);
+    void CopyBufferMemToGDS(VAddr src, VAddr dst, u32 num_bytes);
+    void CopyBufferMemToMem(VAddr src, VAddr dst, u32 num_bytes);
 
     [[nodiscard]] std::pair<Buffer*, u32> ObtainHostUBO(std::span<const u32> data);
 
@@ -108,7 +112,8 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
-    [[nodiscard]] BufferId FindBuffer(VAddr device_addr, u32 size);
+    [[nodiscard]] BufferId FindBuffer(VAddr device_addr, u32 size,
+                                      MemoryUsage memory_usage = MemoryUsage::Stream);
 
 private:
     template <typename Func>
@@ -120,7 +125,7 @@ private:
                 ++page;
                 continue;
             }
-            Buffer& buffer = slot_buffers[buffer_id];
+            Buffer& buffer = GetBuffer(buffer_id);
             func(buffer_id, buffer);
 
             const VAddr end_addr = buffer.CpuAddr() + buffer.SizeBytes();
@@ -132,9 +137,15 @@ private:
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 
+    void LogBufferValue(const std::string& prefix, const Buffer& buffer, u32 offset);
+    u32 ProbeBufferValue(const Buffer& buffer, u32 offset, const std::string& prefix);
+    void CopyBuffer(const vk::Buffer& src, u32 src_offset, const vk::Buffer& dst, u32 dst_offset,
+                    u32 size);
+
     void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
 
-    [[nodiscard]] BufferId CreateBuffer(VAddr device_addr, u32 wanted_size);
+    [[nodiscard]] BufferId CreateBuffer(VAddr device_addr, u32 wanted_size,
+                                        MemoryUsage memory_usage);
 
     void Register(BufferId buffer_id);
 

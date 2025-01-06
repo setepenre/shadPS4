@@ -4,6 +4,7 @@
 #pragma once
 
 #include <condition_variable>
+
 #include <boost/container/static_vector.hpp>
 #include "common/types.h"
 #include "common/unique_function.h"
